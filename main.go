@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
+	"log"
 	"net/http"
 	"sync"
 
@@ -23,93 +23,173 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-var connections = make(map[string]*websocket.Conn)
-var connectionsMutex = &sync.Mutex{}
+// ConnectionManager handles WebSocket connections
+type ConnectionManager struct {
+	connections map[string]*websocket.Conn
+	mutex       sync.RWMutex
+}
 
-type MessageJsonType struct {
+// NewConnectionManager creates a new ConnectionManager
+func NewConnectionManager() *ConnectionManager {
+	return &ConnectionManager{
+		connections: make(map[string]*websocket.Conn),
+	}
+}
+
+// Add a new connection
+func (cm *ConnectionManager) Add(id string, conn *websocket.Conn) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	cm.connections[id] = conn
+}
+
+// Remove a connection
+func (cm *ConnectionManager) Remove(id string) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	delete(cm.connections, id)
+}
+
+// Get a connection
+func (cm *ConnectionManager) Get(id string) (*websocket.Conn, bool) {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+	conn, exists := cm.connections[id]
+	return conn, exists
+}
+
+// SignalMessageSdp represents the structure of WebRTC signaling messages
+type SignalMessageSdp struct {
 	SignalType string `json:"signalType"`
-	UserId     string `json:"userId"`
-	Sdp        string `json:sdp`
+	UserID     string `json:"userId"`
+	SDP        string `json:"sdp_base64"`
 }
 
-func handleConnClose(id string) {
-	fmt.Printf("[%s] Connection closed 🔥\n", id)
-
-	connectionsMutex.Lock()
-	delete(connections, id)
-	connectionsMutex.Unlock()
+type SignalMessageCandidate struct {
+	SignalType string `json:"signalType"`
+	UserID     string `json:"userId"`
+	Candidate  string `json:"candidate"`
 }
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+// WebSocketServer manages WebSocket connections and signaling
+type WebSocketServer struct {
+	connectionManager *ConnectionManager
+}
 
-	if err != nil {
-		fmt.Println("❌ Failed to upgrade to WebSocket: ", err)
-		return
+// NewWebSocketServer creates a new WebSocket server
+func NewWebSocketServer() *WebSocketServer {
+	return &WebSocketServer{
+		connectionManager: NewConnectionManager(),
 	}
-	defer conn.Close()
+}
 
+// handleConnection manages a single WebSocket connection
+func (ws *WebSocketServer) handleConnection(conn *websocket.Conn) {
+	// Generate unique connection ID
 	id := uuid.New().String()
+	log.Printf("[%s] Client connected 🙌\n", id)
 
-	fmt.Printf("[%s] Client connected 🙌\n", id)
+	// Add connection to manager
+	ws.connectionManager.Add(id, conn)
+	defer ws.closeConnection(id, conn)
 
-	connectionsMutex.Lock()
-	connections[id] = conn
-	connectionsMutex.Unlock()
-
-	err = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"userId": "%s"}`, id)))
-	if err != nil {
-		fmt.Println("❌ Failed to send user their id, closing connection...\nError: ", err)
-		handleConnClose(id)
+	// Send connection ID to client
+	if err := conn.WriteJSON(map[string]string{"userId": id}); err != nil {
+		log.Printf("❌ Failed to send user ID: %v\n", err)
 		return
 	}
 
+	// Handle incoming messages
 	for {
 		_, message, err := conn.ReadMessage()
+
+		var genericMessage struct {
+			SignalType string `json:signalType`
+		}
+
+		err = json.Unmarshal(message, &genericMessage)
+
 		if err != nil {
-			if err.Error() == "websocket: close 1001 (going away)" {
-				break
+			log.Printf("❌ Error Parsing Signal Message: %v\n", err)
+		}
+
+		switch genericMessage.SignalType {
+		case "sdp":
+			var messageJson SignalMessageSdp
+			json.Unmarshal(message, &messageJson)
+			ws.forwardSignal(id, messageJson)
+
+		case "candidate":
+			var messageJson SignalMessageCandidate
+			json.Unmarshal(message, &messageJson)
+			ws.forwardSignal(id, messageJson)
+
+		}
+
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway) {
+				log.Printf("❌ Unexpected close error: %v\n", err)
 			}
-			fmt.Printf("❌ Error reading message from %s: %s\n", id, err)
+			break
 		}
 
-		var messageJson MessageJsonType
-
-		fmt.Printf("Recieved from %s: %s\n", id, message)
-
-		err = json.Unmarshal(message, &messageJson)
-
-		if messageJson.SignalType == "offer" {
-			fmt.Println("Got offer")
-			connectionsMutex.Lock()
-			connections[messageJson.UserId].WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"userId": "%s", "sdp": "%s", "signalType": "offer"}`, id, messageJson.Sdp)))
-			connectionsMutex.Unlock()
-		} else if messageJson.SignalType == "answer" {
-			fmt.Println("Got answer")
-			connectionsMutex.Lock()
-			connections[messageJson.UserId].WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"userId": "%s", "sdp": "%s", "signalType": "answer"}`, id, messageJson.Sdp)))
-			connectionsMutex.Unlock()
-		}
-
-		if err != nil {
-			fmt.Println("Error parsing JSON message: ", err)
-		}
-
-		if messageJson.SignalType == "offer" {
-
-		}
-
+		log.Printf("Received from %s: %+v\n", id, message)
 	}
-	handleConnClose(id)
+}
+
+// forwardSignal routes signaling messages between clients
+func (ws *WebSocketServer) forwardSignal(senderID string, message SignalMessageSdp) {
+	// Preserve targetId in a variable
+	targetID := message.UserID
+
+	// Modify message to include sender's ID
+	message.UserID = senderID
+
+	// Get target connection
+	targetConn, exists := ws.connectionManager.Get(targetID)
+	if !exists {
+		log.Printf("❌ Target connection not found: %s\n", message.UserID)
+		return
+	}
+
+	// Forward message
+	if err := targetConn.WriteJSON(message); err != nil {
+		log.Printf("❌ Failed to forward message: %v\n", err)
+	}
+}
+
+// closeConnection handles connection cleanup
+func (ws *WebSocketServer) closeConnection(id string, conn *websocket.Conn) {
+	log.Printf("[%s] Connection closed 🔥\n", id)
+	conn.Close()
+	ws.connectionManager.Remove(id)
+}
+
+// handleWebSocket is the HTTP handler for WebSocket connections
+func (ws *WebSocketServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("❌ Failed to upgrade to WebSocket: %v\n", err)
+		return
+	}
+	ws.handleConnection(conn)
 }
 
 func main() {
-	http.HandleFunc("/ws", handleWebSocket)
+	server := NewWebSocketServer()
 
-	fmt.Println("WebSocket server started on ws://localhost:8080/ws")
-	err := http.ListenAndServe(":8080", nil)
+	http.HandleFunc("/ws", server.handleWebSocket)
 
-	if err != nil {
-		fmt.Println("Failed to start server: ", err)
+	log.Println("WebSocket server started on ws://localhost:8080/ws")
+
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
 	}
 }
+
+// Context:
+// You are implementing candidates exchange feature, the frontend is done now is the time to
+// also implement it in the signaling server, but for that forwardSignal needs to accept 2 types
+// SignalMessageSdp and SignalMessageCandidate, because go is a fucking retarded language
+// we cannot just use | to do or, we need to do some fucking generic type bullshit.
+// just copy that shit over from ChatGPT and get done with this language and back to typescript.
