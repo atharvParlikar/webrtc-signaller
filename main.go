@@ -58,13 +58,14 @@ func (cm *ConnectionManager) Get(id string) (*websocket.Conn, bool) {
 	return conn, exists
 }
 
-// SignalMessageSdp represents the structure of WebRTC signaling messages
+// SignalMessageSdp represents the structure of WebRTC signaling messages for "answer" and "offer"
 type SignalMessageSdp struct {
 	SignalType string `json:"signalType"`
 	UserID     string `json:"userId"`
 	SDP        string `json:"sdp_base64"`
 }
 
+// SignalMessageSdp represents the structure of WebRTC signaling messages for "candidate" (ice-candidates)
 type SignalMessageCandidate struct {
 	SignalType string `json:"signalType"`
 	UserID     string `json:"userId"`
@@ -104,7 +105,7 @@ func (ws *WebSocketServer) handleConnection(conn *websocket.Conn) {
 		_, message, err := conn.ReadMessage()
 
 		var genericMessage struct {
-			SignalType string `json:signalType`
+			SignalType string `json:"signalType"`
 		}
 
 		err = json.Unmarshal(message, &genericMessage)
@@ -113,16 +114,23 @@ func (ws *WebSocketServer) handleConnection(conn *websocket.Conn) {
 			log.Printf("❌ Error Parsing Signal Message: %v\n", err)
 		}
 
+		log.Println("generic message: ", genericMessage)
+
 		switch genericMessage.SignalType {
-		case "sdp":
+		case "offer":
 			var messageJson SignalMessageSdp
 			json.Unmarshal(message, &messageJson)
-			ws.forwardSignal(id, messageJson)
+			ws.forwardSignalSdp(id, messageJson)
+
+		case "answer":
+			var messageJson SignalMessageSdp
+			json.Unmarshal(message, &messageJson)
+			ws.forwardSignalSdp(id, messageJson)
 
 		case "candidate":
 			var messageJson SignalMessageCandidate
 			json.Unmarshal(message, &messageJson)
-			ws.forwardSignal(id, messageJson)
+			ws.forwardSignalCandidate(id, messageJson)
 
 		}
 
@@ -132,13 +140,31 @@ func (ws *WebSocketServer) handleConnection(conn *websocket.Conn) {
 			}
 			break
 		}
-
-		log.Printf("Received from %s: %+v\n", id, message)
 	}
 }
 
 // forwardSignal routes signaling messages between clients
-func (ws *WebSocketServer) forwardSignal(senderID string, message SignalMessageSdp) {
+func (ws *WebSocketServer) forwardSignalSdp(senderID string, message SignalMessageSdp) {
+	// Preserve targetId in a variable
+	targetID := message.UserID
+
+	// Modify message to include sender's ID
+	message.UserID = senderID
+
+	// Get target connection
+	targetConn, exists := ws.connectionManager.Get(targetID)
+	if !exists {
+		log.Printf("❌ Target connection not found: %s\n", message.UserID)
+		return
+	}
+
+	// Forward message
+	if err := targetConn.WriteJSON(message); err != nil {
+		log.Printf("❌ Failed to forward message: %v\n", err)
+	}
+}
+
+func (ws *WebSocketServer) forwardSignalCandidate(senderID string, message SignalMessageCandidate) {
 	// Preserve targetId in a variable
 	targetID := message.UserID
 
@@ -186,10 +212,3 @@ func main() {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }
-
-// Context:
-// You are implementing candidates exchange feature, the frontend is done now is the time to
-// also implement it in the signaling server, but for that forwardSignal needs to accept 2 types
-// SignalMessageSdp and SignalMessageCandidate, because go is a fucking retarded language
-// we cannot just use | to do or, we need to do some fucking generic type bullshit.
-// just copy that shit over from ChatGPT and get done with this language and back to typescript.
